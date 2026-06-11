@@ -1,43 +1,65 @@
 """
-S.Tater Trading — Live Backend Server (v2)
+S.Tater Trading — Live Backend Server (v3)
 ===========================================
+NEW IN V3: ICICI Direct Breeze API as the primary data source.
+Yahoo Finance remains the automatic fallback, so the dashboard
+works even on days the Breeze session is not refreshed.
+
 Endpoints:
+  POST /alert     ← TradingView VCP alert webhook
+  GET  /signals   ← stored alerts
+  GET  /quotes    ← indices + commodities  (Breeze first, Yahoo fallback)
+  GET  /fno       ← PCR / Max Pain / Max OI (Breeze chain first, NSE fallback)
+  GET  /holdings  ← your ICICI Direct demat holdings (auto-loads portfolio)
+  GET  /news      ← latest headline per stock (?symbols=BEL,ONGC)
+  GET  /session   ← paste the daily Breeze session token (?token=XXXX&pin=YYYY)
+  GET  /status    ← is Breeze connected right now?
 
-  POST /alert    ← TradingView VCP alert webhook
-  GET  /signals  ← stored alerts for the dashboard
-  GET  /quotes   ← Nifty, Sensex, VIX, GIFT, USD/INR, gold/silver/crude (MCX est.)
-  GET  /fno      ← PCR, Max Pain, Max Call/Put OI for NIFTY and BANKNIFTY
-  GET  /news     ← latest headline per portfolio stock (?symbols=BEL,ONGC,...)
+CREDENTIALS — set these in Render > your service > Environment tab.
+NEVER write the actual keys inside this file:
+  BREEZE_API_KEY     = your App Key from api.icicidirect.com
+  BREEZE_API_SECRET  = your Secret Key
+  ADMIN_PIN          = any 4-6 digit number you choose (protects /session)
 
-Host on Render.com free tier.
+DAILY MORNING STEP (SEBI requires a fresh session every day, ~1 minute):
+  1. Open:  https://api.icicidirect.com/apiuser/login?api_key=YOUR_APP_KEY
+  2. Log in with your ICICI Direct user ID + password
+  3. After login the address bar shows ...apisession=XXXXXXXX — copy that number
+  4. Open:  https://your-server.onrender.com/session?token=XXXXXXXX&pin=YOUR_PIN
+  5. You should see {"status": "breeze connected"} — done for the day.
+
 Built for Mr. Sudhinder Tater, June 2026.
 """
 
 import json
 import os
 import time
+import calendar
 import sqlite3
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), 'signals.db')
 
-# ── MCX calibration ───────────────────────────────────────────────────────────
-# MCX rupee contracts are not on any free API. We estimate them from
-# international prices (COMEX gold/silver, WTI crude) x USD/INR, then apply a
-# calibration factor that captures import duty, GST, and local premium.
-# Factors below were calibrated against verified MCX closes on 9 Jun 2026.
-# If the estimate drifts from actual MCX over months, update these numbers:
-#   new_factor = actual_MCX_price / raw_converted_price
-CAL_GOLD   = 1.167   # MCX ₹/10g vs COMEX $/oz × INR
-CAL_SILVER = 1.179   # MCX ₹/kg  vs COMEX $/oz × INR
-CAL_CRUDE  = 0.977   # MCX ₹/bbl vs WTI $/bbl × INR
-TROY_OZ_G  = 31.1035
+# ── Credentials from environment (placeholders — set real values on Render) ──
+BREEZE_API_KEY    = os.environ.get('BREEZE_API_KEY', '')
+BREEZE_API_SECRET = os.environ.get('BREEZE_API_SECRET', '')
+ADMIN_PIN         = os.environ.get('ADMIN_PIN', '')
+
+# ── MCX calibration (estimates from international prices, see v2 notes) ──────
+CAL_GOLD, CAL_SILVER, CAL_CRUDE = 1.167, 1.179, 0.977
+TROY_OZ_G = 31.1035
+
+# Breeze stock codes for indices (ICICI's own codes, not NSE symbols)
+BREEZE_NIFTY     = 'NIFTY'
+BREEZE_BANKNIFTY = 'CNXBAN'
 
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# DATABASE
+# ══════════════════════════════════════════════════════════════════════════════
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -47,16 +69,24 @@ def get_db():
 
 def init_db():
     with get_db() as conn:
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS signals (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                stock       TEXT NOT NULL,
-                signal      TEXT,
-                price       TEXT,
-                bar_time    TEXT,
-                received_at TEXT
-            )
-        ''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stock TEXT NOT NULL, signal TEXT, price TEXT,
+            bar_time TEXT, received_at TEXT)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY, value TEXT)''')
+        conn.commit()
+
+
+def get_setting(key):
+    with get_db() as conn:
+        row = conn.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+        return row['value'] if row else None
+
+
+def set_setting(key, value):
+    with get_db() as conn:
+        conn.execute('INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)', (key, value))
         conn.commit()
 
 
@@ -69,10 +99,210 @@ def add_cors(resp):
     return resp
 
 
-# ── Caches (avoid hammering external sources) ─────────────────────────────────
-_q_cache    = {'data': None, 'ts': 0}   # quotes  — 60 s
-_fno_cache  = {'data': None, 'ts': 0}   # F&O     — 180 s
-_news_cache = {}                        # news    — 600 s per symbol
+# ══════════════════════════════════════════════════════════════════════════════
+# BREEZE CONNECTION (primary data source)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_breeze = {'client': None, 'token': None, 'err': 'not connected yet'}
+
+
+def get_breeze():
+    """Return a live Breeze client, or None (callers then fall back to Yahoo)."""
+    token = get_setting('breeze_session')
+    if not (BREEZE_API_KEY and BREEZE_API_SECRET):
+        _breeze['err'] = 'API key/secret not set in environment'
+        return None
+    if not token:
+        _breeze['err'] = 'no session token yet — do the morning /session step'
+        return None
+    # Reuse existing client if the token hasn't changed
+    if _breeze['client'] is not None and _breeze['token'] == token:
+        return _breeze['client']
+    try:
+        from breeze_connect import BreezeConnect
+        b = BreezeConnect(api_key=BREEZE_API_KEY)
+        b.generate_session(api_secret=BREEZE_API_SECRET, session_token=token)
+        _breeze.update(client=b, token=token, err=None)
+        print('[BREEZE] session connected')
+        return b
+    except Exception as e:
+        _breeze.update(client=None, err=str(e))
+        print(f'[BREEZE ERR] {e}')
+        return None
+
+
+def _success_rows(resp):
+    """Breeze responses wrap data in {'Success': [...]}; be defensive."""
+    if isinstance(resp, dict):
+        rows = resp.get('Success')
+        if isinstance(rows, list):
+            return rows
+        if isinstance(rows, dict):
+            return [rows]
+    return []
+
+
+def _num(x):
+    try:
+        v = float(str(x).replace(',', ''))
+        return v
+    except (TypeError, ValueError):
+        return None
+
+
+def _pick(row, *names):
+    """Return the first present, non-empty field among candidate key names."""
+    for n in names:
+        if n in row and row[n] not in (None, '', 0, '0'):
+            return row[n]
+    for n in names:           # second pass: allow zero values
+        if n in row and row[n] not in (None, ''):
+            return row[n]
+    return None
+
+
+def breeze_quote(stock_code, exchange_code='NSE'):
+    """(last, chg_pct, prev_close) via Breeze, or (None, None, None)."""
+    b = get_breeze()
+    if not b:
+        return None, None, None
+    try:
+        r = b.get_quotes(stock_code=stock_code, exchange_code=exchange_code,
+                         expiry_date='', product_type='cash', right='', strike_price='')
+        rows = _success_rows(r)
+        if not rows:
+            return None, None, None
+        row = rows[0]
+        ltp  = _num(_pick(row, 'ltp', 'last_traded_price', 'close'))
+        prev = _num(_pick(row, 'previous_close', 'prev_close', 'open'))
+        chg = round((ltp - prev) / prev * 100, 2) if (ltp and prev) else None
+        return (round(ltp, 2) if ltp else None), chg, (round(prev, 2) if prev else None)
+    except Exception as e:
+        print(f'[BREEZE QUOTE WARN] {stock_code}: {e}')
+        return None, None, None
+
+
+# ── expiry helpers for option chain ───────────────────────────────────────────
+
+def next_thursday(d: date) -> date:
+    return d + timedelta(days=(3 - d.weekday()) % 7)        # Thu = weekday 3
+
+
+def last_thursday_of_month(y: int, m: int) -> date:
+    last = date(y, m, calendar.monthrange(y, m)[1])
+    return last - timedelta(days=(last.weekday() - 3) % 7)
+
+
+def expiry_iso(d: date) -> str:
+    return d.isoformat() + 'T06:00:00.000Z'
+
+
+def breeze_option_chain(stock_code, expiry: date):
+    """{strike: {'ce': oi, 'pe': oi}} from Breeze, or None on failure."""
+    b = get_breeze()
+    if not b:
+        return None
+    chain = {}
+    try:
+        for right in ('call', 'put'):
+            r = b.get_option_chain_quotes(
+                stock_code=stock_code, exchange_code='NFO',
+                product_type='options', expiry_date=expiry_iso(expiry),
+                right=right, strike_price='')
+            for row in _success_rows(r):
+                k = _num(_pick(row, 'strike_price', 'strikePrice'))
+                oi = _num(_pick(row, 'open_interest', 'openInterest', 'oi')) or 0
+                if k is None:
+                    continue
+                k = int(k)
+                chain.setdefault(k, {'ce': 0, 'pe': 0})
+                chain[k]['ce' if right == 'call' else 'pe'] = int(oi)
+            time.sleep(0.4)   # stay well inside the 100 calls/min limit
+        return chain if chain else None
+    except Exception as e:
+        print(f'[BREEZE CHAIN WARN] {stock_code}: {e}')
+        return None
+
+
+def analyse_strikes(chain, expiry_label, source):
+    strikes = sorted(chain.keys())
+    if not strikes:
+        return {'error': 'empty chain'}
+    tot_ce = sum(v['ce'] for v in chain.values())
+    tot_pe = sum(v['pe'] for v in chain.values())
+    pcr = round(tot_pe / tot_ce, 2) if tot_ce else None
+    max_call = max(strikes, key=lambda k: chain[k]['ce'])
+    max_put  = max(strikes, key=lambda k: chain[k]['pe'])
+
+    def writer_payout(s):
+        pay = 0
+        for k in strikes:
+            pay += chain[k]['ce'] * max(0, s - k)
+            pay += chain[k]['pe'] * max(0, k - s)
+        return pay
+
+    max_pain = min(strikes, key=writer_payout)
+    return {'pcr': pcr, 'max_pain': max_pain, 'max_call': max_call,
+            'max_put': max_put, 'expiry': expiry_label, 'source': source,
+            'total_ce_oi': tot_ce, 'total_pe_oi': tot_pe}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# YAHOO FALLBACK
+# ══════════════════════════════════════════════════════════════════════════════
+
+def yf_quote(sym):
+    try:
+        import yfinance as yf
+        fi = yf.Ticker(sym).fast_info
+        lp, pc = float(fi.last_price), float(fi.previous_close)
+        chg = round((lp - pc) / pc * 100, 2) if pc else None
+        return round(lp, 2), chg, round(pc, 2)
+    except Exception as ex:
+        print(f'[YF WARN] {sym}: {ex}')
+        return None, None, None
+
+
+def nse_chain_fallback(symbol):
+    """v2's NSE scraping, kept as last resort for the option chain."""
+    import requests
+    s = requests.Session()
+    s.headers.update({
+        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                       'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'),
+        'Accept-Language': 'en-US,en;q=0.9', 'Accept': 'application/json',
+        'Referer': 'https://www.nseindia.com/option-chain'})
+    s.get('https://www.nseindia.com', timeout=10)
+    r = s.get(f'https://www.nseindia.com/api/option-chain-indices?symbol={symbol}',
+              timeout=12)
+    r.raise_for_status()
+    records = r.json().get('records', {})
+    expiries = records.get('expiryDates') or []
+    rows = records.get('data') or []
+    if not expiries or not rows:
+        return {'error': 'empty NSE chain'}
+    expiry = expiries[0]
+    chain = {}
+    for row in rows:
+        if row.get('expiryDate') != expiry:
+            continue
+        k = row.get('strikePrice')
+        if k is None:
+            continue
+        chain.setdefault(int(k), {'ce': 0, 'pe': 0})
+        chain[int(k)]['ce'] = (row.get('CE') or {}).get('openInterest', 0) or 0
+        chain[int(k)]['pe'] = (row.get('PE') or {}).get('openInterest', 0) or 0
+    return analyse_strikes(chain, expiry, 'nse-fallback')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CACHES
+# ══════════════════════════════════════════════════════════════════════════════
+_q_cache    = {'data': None, 'ts': 0}
+_fno_cache  = {'data': None, 'ts': 0}
+_hold_cache = {'data': None, 'ts': 0}
+_news_cache = {}
+_name_cache = {}    # ICICI stock code -> NSE symbol
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -81,13 +311,40 @@ _news_cache = {}                        # news    — 600 s per symbol
 
 @app.route('/')
 def home():
+    return add_cors(jsonify({'status': 'ST Trading server v3 running',
+                             'time': datetime.utcnow().isoformat() + 'Z'}))
+
+
+@app.route('/status')
+def status():
+    connected = get_breeze() is not None
     return add_cors(jsonify({
-        'status': 'ST Trading server v2 running',
-        'time': datetime.utcnow().isoformat() + 'Z'
-    }))
+        'breeze_connected': connected,
+        'breeze_error': None if connected else _breeze['err'],
+        'keys_set': bool(BREEZE_API_KEY and BREEZE_API_SECRET),
+        'data_mode': 'ICICI Breeze (live)' if connected else 'Yahoo fallback'}))
 
 
-# ── TradingView webhook ───────────────────────────────────────────────────────
+@app.route('/session')
+def set_session():
+    """Morning step: /session?token=XXXXXXXX&pin=YOUR_PIN"""
+    pin = request.args.get('pin', '')
+    token = request.args.get('token', '').strip()
+    if ADMIN_PIN and pin != ADMIN_PIN:
+        return add_cors(jsonify({'status': 'wrong pin'})), 403
+    if not token:
+        return add_cors(jsonify({'status': 'no token given',
+                                 'usage': '/session?token=XXXXXXXX&pin=YOUR_PIN'})), 400
+    set_setting('breeze_session', token)
+    _breeze['client'] = None           # force reconnect with the new token
+    ok = get_breeze() is not None
+    # Clear data caches so the next calls use Breeze immediately
+    _q_cache['ts'] = _fno_cache['ts'] = _hold_cache['ts'] = 0
+    return add_cors(jsonify({'status': 'breeze connected' if ok
+                             else f"saved, but connect failed: {_breeze['err']}"}))
+
+
+# ── TradingView webhook (unchanged from v2) ───────────────────────────────────
 
 @app.route('/alert', methods=['POST', 'OPTIONS'])
 def receive_alert():
@@ -95,20 +352,18 @@ def receive_alert():
         return add_cors(jsonify({})), 200
     try:
         p = request.get_json(force=True, silent=True) or {}
-        stock    = str(p.get('stock', 'UNKNOWN')).upper().replace('NSE:', '').strip()
-        signal   = str(p.get('signal', 'Alert')).strip()
-        price    = str(p.get('price', '')).strip()
-        bar_time = str(p.get('time', '')).strip()
-        received = datetime.utcnow().isoformat() + 'Z'
+        stock = str(p.get('stock', 'UNKNOWN')).upper().replace('NSE:', '').strip()
         with get_db() as conn:
-            conn.execute(
-                'INSERT INTO signals (stock, signal, price, bar_time, received_at) VALUES (?,?,?,?,?)',
-                (stock, signal, price, bar_time, received))
+            conn.execute('INSERT INTO signals (stock,signal,price,bar_time,received_at) '
+                         'VALUES (?,?,?,?,?)',
+                         (stock, str(p.get('signal', 'Alert')).strip(),
+                          str(p.get('price', '')).strip(),
+                          str(p.get('time', '')).strip(),
+                          datetime.utcnow().isoformat() + 'Z'))
             conn.commit()
-        print(f'[ALERT] {stock} | {signal} | {price}')
+        print(f'[ALERT] {stock}')
         return add_cors(jsonify({'status': 'ok', 'stock': stock})), 200
     except Exception as e:
-        print(f'[ALERT ERR] {e}')
         return add_cors(jsonify({'status': 'error', 'detail': str(e)})), 500
 
 
@@ -116,29 +371,14 @@ def receive_alert():
 def get_signals():
     try:
         with get_db() as conn:
-            rows = conn.execute(
-                'SELECT stock, signal, price, bar_time, received_at FROM signals ORDER BY id DESC LIMIT 100'
-            ).fetchall()
+            rows = conn.execute('SELECT stock,signal,price,bar_time,received_at '
+                                'FROM signals ORDER BY id DESC LIMIT 100').fetchall()
         return add_cors(jsonify([dict(r) for r in rows]))
     except Exception as e:
         return add_cors(jsonify({'error': str(e)})), 500
 
 
-# ── Quotes: indices + GIFT + commodities ──────────────────────────────────────
-
-def _yf_quote(sym):
-    """Return (last, change_pct, prev_close) for a Yahoo symbol, or Nones."""
-    try:
-        import yfinance as yf
-        fi = yf.Ticker(sym).fast_info
-        lp = float(fi.last_price)
-        pc = float(fi.previous_close)
-        chg = round((lp - pc) / pc * 100, 2) if pc else None
-        return round(lp, 2), chg, round(pc, 2)
-    except Exception as ex:
-        print(f'[YF WARN] {sym}: {ex}')
-        return None, None, None
-
+# ── QUOTES: Breeze first, Yahoo fallback ──────────────────────────────────────
 
 @app.route('/quotes')
 def get_quotes():
@@ -148,19 +388,31 @@ def get_quotes():
         return add_cors(jsonify(_q_cache['data']))
 
     out = {}
+    breeze_on = get_breeze() is not None
 
-    # Indian indices
-    for key, sym in [('nifty', '^NSEI'), ('sensex', '^BSESN'), ('vix', '^INDIAVIX')]:
-        v, c, p = _yf_quote(sym)
-        out[key] = {'val': v, 'chg': c, 'prev': p}
+    # NIFTY and BANK NIFTY — Breeze first
+    for key, bcode, ysym in [('nifty', BREEZE_NIFTY, '^NSEI'),
+                             ('banknifty', BREEZE_BANKNIFTY, '^NSEBANK')]:
+        v = c = p = None
+        if breeze_on:
+            v, c, p = breeze_quote(bcode, 'NSE')
+        if v is None:
+            v, c, p = yf_quote(ysym)
+            src = 'yahoo'
+        else:
+            src = 'breeze'
+        out[key] = {'val': v, 'chg': c, 'prev': p, 'source': src}
 
-    # GIFT Nifty — no free public feed exists (NSE IX data is licensed).
-    # Best free proxy: Nifty futures move ≈ GIFT after 9:15; pre-market it is
-    # unavailable, so we return null and the dashboard keeps its last value.
+    # SENSEX and VIX — Yahoo (not exposed cleanly on Breeze)
+    for key, ysym in [('sensex', '^BSESN'), ('vix', '^INDIAVIX')]:
+        v, c, p = yf_quote(ysym)
+        out[key] = {'val': v, 'chg': c, 'prev': p, 'source': 'yahoo'}
+
+    # GIFT Nifty — no free feed exists (NSE IX licenses it)
     out['gift'] = {'val': None, 'chg': None,
                    'note': 'No free GIFT feed; check nseix.com pre-market'}
 
-    # USD/INR — Frankfurter (free, no key, reliable)
+    # USD/INR
     usdinr = None
     try:
         import urllib.request
@@ -171,107 +423,26 @@ def get_quotes():
         print(f'[FX WARN] {ex}')
     out['usdinr'] = {'val': usdinr}
 
-    # International commodities (COMEX / NYMEX via Yahoo)
-    gold_usd,   gold_chg,   _ = _yf_quote('GC=F')   # $ per troy oz
-    silver_usd, silver_chg, _ = _yf_quote('SI=F')   # $ per troy oz
-    wti_usd,    wti_chg,    _ = _yf_quote('CL=F')   # $ per barrel
-    brent_usd,  _,          _ = _yf_quote('BZ=F')
+    # Commodities — international (Yahoo) with MCX estimates
+    gold, gchg, _ = yf_quote('GC=F')
+    silver, schg, _ = yf_quote('SI=F')
+    wti, wchg, _ = yf_quote('CL=F')
+    brent, _, _ = yf_quote('BZ=F')
+    out['gold_spot']   = {'val': gold,   'chg': gchg}
+    out['silver_spot'] = {'val': silver, 'chg': schg}
+    out['crude_wti']   = {'val': wti,    'chg': wchg}
+    out['brent']       = {'val': brent}
+    out['gold_mcx']   = {'val': round(gold * usdinr / TROY_OZ_G * 10 * CAL_GOLD) if (gold and usdinr) else None, 'chg': gchg, 'est': True}
+    out['silver_mcx'] = {'val': round(silver * usdinr / TROY_OZ_G * 1000 * CAL_SILVER) if (silver and usdinr) else None, 'chg': schg, 'est': True}
+    out['crude_mcx']  = {'val': round(wti * usdinr * CAL_CRUDE) if (wti and usdinr) else None, 'chg': wchg, 'est': True}
 
-    out['gold_spot']   = {'val': gold_usd,   'chg': gold_chg}
-    out['silver_spot'] = {'val': silver_usd, 'chg': silver_chg}
-    out['crude_wti']   = {'val': wti_usd,    'chg': wti_chg}
-    out['brent']       = {'val': brent_usd}
-
-    # MCX estimates (clearly estimates — see calibration note at top of file)
-    if usdinr and gold_usd:
-        out['gold_mcx'] = {
-            'val': round(gold_usd * usdinr / TROY_OZ_G * 10 * CAL_GOLD),
-            'chg': gold_chg, 'est': True}
-    else:
-        out['gold_mcx'] = {'val': None}
-
-    if usdinr and silver_usd:
-        out['silver_mcx'] = {
-            'val': round(silver_usd * usdinr / TROY_OZ_G * 1000 * CAL_SILVER),
-            'chg': silver_chg, 'est': True}
-    else:
-        out['silver_mcx'] = {'val': None}
-
-    if usdinr and wti_usd:
-        out['crude_mcx'] = {
-            'val': round(wti_usd * usdinr * CAL_CRUDE),
-            'chg': wti_chg, 'est': True}
-    else:
-        out['crude_mcx'] = {'val': None}
-
+    out['data_mode'] = 'breeze' if breeze_on else 'yahoo-fallback'
     out['fetched_at'] = datetime.utcnow().isoformat() + 'Z'
     _q_cache = {'data': out, 'ts': now}
     return add_cors(jsonify(out))
 
 
-# ── F&O: PCR, Max Pain, Max OI from NSE option chain ─────────────────────────
-
-def _nse_session():
-    """NSE blocks plain requests; warm up a session with browser headers."""
-    import requests
-    s = requests.Session()
-    s.headers.update({
-        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                       'AppleWebKit/537.36 (KHTML, like Gecko) '
-                       'Chrome/124.0 Safari/537.36'),
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept': 'application/json, text/plain, */*',
-        'Referer': 'https://www.nseindia.com/option-chain',
-    })
-    # First hit the homepage to receive cookies
-    s.get('https://www.nseindia.com', timeout=10)
-    return s
-
-
-def _analyse_chain(payload):
-    """Compute PCR, max pain, max call/put OI strikes for the nearest expiry."""
-    records = payload.get('records', {})
-    expiries = records.get('expiryDates') or []
-    rows = records.get('data') or []
-    if not expiries or not rows:
-        return {'error': 'empty chain'}
-
-    expiry = expiries[0]                       # nearest expiry
-    strikes, ce_oi, pe_oi = [], {}, {}
-    for row in rows:
-        if row.get('expiryDate') != expiry:
-            continue
-        k = row.get('strikePrice')
-        if k is None:
-            continue
-        strikes.append(k)
-        ce_oi[k] = (row.get('CE') or {}).get('openInterest', 0) or 0
-        pe_oi[k] = (row.get('PE') or {}).get('openInterest', 0) or 0
-
-    strikes = sorted(set(strikes))
-    if not strikes:
-        return {'error': 'no strikes for nearest expiry'}
-
-    tot_ce = sum(ce_oi.values())
-    tot_pe = sum(pe_oi.values())
-    pcr = round(tot_pe / tot_ce, 2) if tot_ce else None
-    max_call = max(strikes, key=lambda k: ce_oi.get(k, 0))
-    max_put  = max(strikes, key=lambda k: pe_oi.get(k, 0))
-
-    # Max pain: settlement price where option writers' total payout is lowest
-    def writer_payout(s):
-        pay = 0
-        for k in strikes:
-            pay += ce_oi.get(k, 0) * max(0, s - k)   # calls ITM above k
-            pay += pe_oi.get(k, 0) * max(0, k - s)   # puts ITM below k
-        return pay
-
-    max_pain = min(strikes, key=writer_payout)
-
-    return {'pcr': pcr, 'max_pain': max_pain, 'max_call': max_call,
-            'max_put': max_put, 'expiry': expiry,
-            'total_ce_oi': tot_ce, 'total_pe_oi': tot_pe}
-
+# ── F&O: Breeze official chain first, NSE scrape fallback ─────────────────────
 
 @app.route('/fno')
 def get_fno():
@@ -280,46 +451,107 @@ def get_fno():
     if _fno_cache['data'] and (now - _fno_cache['ts']) < 180:
         return add_cors(jsonify(_fno_cache['data']))
 
+    today = date.today()
+    nifty_exp = next_thursday(today)
+    bn_exp = last_thursday_of_month(today.year, today.month)
+    if bn_exp < today:
+        nxt = today.replace(day=1) + timedelta(days=32)
+        bn_exp = last_thursday_of_month(nxt.year, nxt.month)
+
     out = {}
-    try:
-        s = _nse_session()
-        for key, symbol in [('nifty', 'NIFTY'), ('banknifty', 'BANKNIFTY')]:
-            try:
-                r = s.get('https://www.nseindia.com/api/option-chain-indices'
-                          f'?symbol={symbol}', timeout=12)
-                r.raise_for_status()
-                out[key] = _analyse_chain(r.json())
-                print(f'[FNO] {symbol}: {out[key]}')
+    for key, bcode, nse_sym, exp in [('nifty', BREEZE_NIFTY, 'NIFTY', nifty_exp),
+                                     ('banknifty', BREEZE_BANKNIFTY, 'BANKNIFTY', bn_exp)]:
+        result = None
+        chain = breeze_option_chain(bcode, exp)          # 1) official Breeze
+        if chain:
+            result = analyse_strikes(chain, exp.strftime('%d-%b-%Y'), 'breeze')
+        if not result or result.get('error'):
+            try:                                          # 2) NSE fallback
+                result = nse_chain_fallback(nse_sym)
             except Exception as ex:
-                print(f'[FNO WARN] {symbol}: {ex}')
-                out[key] = {'error': str(ex)}
-            time.sleep(1)  # be polite between the two calls
-    except Exception as e:
-        print(f'[FNO ERR] session: {e}')
-        out = {'nifty': {'error': str(e)}, 'banknifty': {'error': str(e)}}
+                result = {'error': str(ex)}
+        out[key] = result
+        print(f'[FNO] {key}: {result}')
 
     out['fetched_at'] = datetime.utcnow().isoformat() + 'Z'
-    # Only cache successful pulls so a failure retries quickly
     if not out.get('nifty', {}).get('error') or not out.get('banknifty', {}).get('error'):
         _fno_cache = {'data': out, 'ts': now}
     return add_cors(jsonify(out))
 
 
-# ── News: latest headline per portfolio stock ─────────────────────────────────
+# ── HOLDINGS: auto-load your ICICI Direct portfolio ───────────────────────────
+
+def icici_to_nse(code, breeze):
+    """Map ICICI's internal stock code to the NSE symbol (cached)."""
+    if code in _name_cache:
+        return _name_cache[code]
+    nse = code
+    try:
+        r = breeze.get_names(exchange_code='NSE', stock_code=code)
+        if isinstance(r, dict):
+            cand = _pick(r, 'nse_stock_code', 'NSE_StockCode', 'exchange_stock_code',
+                         'exchange_code_name', 'stock_code')
+            if cand:
+                nse = str(cand).strip().upper()
+    except Exception as ex:
+        print(f'[NAMES WARN] {code}: {ex}')
+    _name_cache[code] = nse
+    return nse
+
+
+@app.route('/holdings')
+def get_holdings():
+    global _hold_cache
+    now = time.time()
+    if _hold_cache['data'] and (now - _hold_cache['ts']) < 300:
+        return add_cors(jsonify(_hold_cache['data']))
+
+    b = get_breeze()
+    if not b:
+        return add_cors(jsonify({'error': 'breeze not connected',
+                                 'detail': _breeze['err']})), 503
+    out = []
+    try:
+        r = b.get_demat_holdings()
+        rows = _success_rows(r)
+        for row in rows[:60]:
+            code = str(_pick(row, 'stock_code', 'stockCode', 'symbol') or '').strip()
+            if not code:
+                continue
+            qty = _num(_pick(row, 'quantity', 'total_quantity', 'demat_total_bulk_quantity'))
+            avg = _num(_pick(row, 'average_price', 'avg_price', 'average_cost', 'cost_price'))
+            cmp_ = _num(_pick(row, 'current_market_price', 'ltp', 'close_price',
+                              'market_price', 'previous_close'))
+            co = str(_pick(row, 'company_name', 'stock_name', 'companyName') or '').strip()
+            nse = icici_to_nse(code, b)
+            # Enrich missing CMP via a live quote (only for the first few, rate-limit safe)
+            if cmp_ is None and len(out) < 20:
+                v, _, _ = breeze_quote(code, 'NSE')
+                cmp_ = v
+            out.append({'sym': nse, 'icici_code': code, 'co': co or nse,
+                        'qty': qty, 'avg': avg, 'cmp': cmp_})
+        payload = {'holdings': out, 'count': len(out), 'source': 'breeze',
+                   'fetched_at': datetime.utcnow().isoformat() + 'Z'}
+        _hold_cache = {'data': payload, 'ts': now}
+        return add_cors(jsonify(payload))
+    except Exception as e:
+        print(f'[HOLDINGS ERR] {e}')
+        return add_cors(jsonify({'error': str(e)})), 500
+
+
+# ── NEWS (unchanged from v2) ──────────────────────────────────────────────────
 
 @app.route('/news')
 def get_news():
-    syms_raw = request.args.get('symbols', '')
-    syms = [s.strip().upper() for s in syms_raw.split(',') if s.strip()][:25]
+    syms = [s.strip().upper() for s in request.args.get('symbols', '').split(',')
+            if s.strip()][:25]
     if not syms:
-        return add_cors(jsonify({'error': 'pass ?symbols=BEL,ONGC,...'})), 400
-
+        return add_cors(jsonify({'error': 'pass ?symbols=BEL,ONGC'})), 400
     now = time.time()
     out = {}
     try:
         import yfinance as yf
         for sym in syms:
-            # serve from per-symbol cache if under 10 minutes old
             c = _news_cache.get(sym)
             if c and (now - c['ts']) < 600:
                 out[sym] = c['data']
@@ -329,18 +561,13 @@ def get_news():
                 news = yf.Ticker(sym + '.NS').news or []
                 if news:
                     n0 = news[0]
-                    # yfinance news schema varies by version; handle both
                     content = n0.get('content', n0)
                     title = content.get('title') or n0.get('title')
                     link = (content.get('canonicalUrl') or {}).get('url') \
-                        if isinstance(content.get('canonicalUrl'), dict) \
-                        else n0.get('link')
+                        if isinstance(content.get('canonicalUrl'), dict) else n0.get('link')
                     ts = n0.get('providerPublishTime')
-                    when = None
-                    if ts:
-                        when = datetime.fromtimestamp(int(ts)).strftime('%d %b')
-                    elif content.get('pubDate'):
-                        when = str(content['pubDate'])[:10]
+                    when = datetime.fromtimestamp(int(ts)).strftime('%d %b') if ts \
+                        else (str(content.get('pubDate'))[:10] if content.get('pubDate') else None)
                     item = {'title': title, 'link': link, 'time': when}
             except Exception as ex:
                 print(f'[NEWS WARN] {sym}: {ex}')
@@ -348,12 +575,11 @@ def get_news():
             _news_cache[sym] = {'data': item, 'ts': now}
     except ImportError:
         return add_cors(jsonify({'error': 'yfinance missing'})), 500
-
     return add_cors(jsonify(out))
 
 
-# ── Local dev ─────────────────────────────────────────────────────────────────
+# ── local dev ─────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print(f'Starting on http://0.0.0.0:{port}')
+    print(f'Starting v3 on http://0.0.0.0:{port}')
     app.run(host='0.0.0.0', port=port, debug=True)
